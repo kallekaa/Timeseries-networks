@@ -27,19 +27,21 @@ python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 1. Select a dataset and inspect its train, validation, and test periods.
 2. Move the input-window slider to see exactly what the network gets as input.
 3. Select **Compare both** and train with a 12-month lookback.
-4. Compare MAE, RMSE, and WAPE with the last-month and seasonal naïve baselines.
-5. Inspect the learning curves, then compare the one-step test plot with the recursive future forecast.
-6. Change one setting at a time and retrain to understand its effect.
+4. In **Test the models**, compare recursive forecasts with the last-month and seasonal naïve baselines at every lead time. Select an origin to see what was known then and what happened afterward.
+5. Inspect the one-step and training diagnostics, then compare the backtest with the future forecast.
+6. Change the forecast horizon freely. Changing network or training settings requires retraining; changing only the horizon does not.
 
-The split is fixed at 60% training, 20% validation, and 20% test, in chronological order. Scaling uses training observations only. Validation chooses the best epoch via early stopping; test data stays untouched until evaluation. Test predictions are rolling one-step predictions: earlier actuals in the test period can appear in later input windows. Future predictions are recursive and use earlier predictions instead.
+The split is fixed at 60% training, 20% validation, and 20% test, in chronological order. Scaling uses training observations only. Validation chooses the best epoch via early stopping; test data stays untouched until evaluation. In the main backtest, each forecast origin is the last known month before a recursive forecast. Later test actuals become available only at later origins. Model weights stay fixed throughout the test period. The one-step comparison remains available as a diagnostic.
+
+For a selected horizon, scores use only origins with all forecast months observed. All methods and lead times use that same set of origins. Longer horizons therefore have fewer complete origins; for AirPassengers, a 24-month horizon has only six. The chart and table show MAE, RMSE, WAPE, and signed bias (positive means overforecasting). Forecast-horizon changes select from paths already computed after training.
 
 The model is **univariate**. It does not know future promotions, prices, holidays, or stockouts. The synthetic datasets are generated from fixed random seeds. AirPassengers is bundled for offline use from the [R `datasets` package](https://rweb.stat.umn.edu/R/library/datasets/html/AirPassengers.html); the values were checked against the [Rdatasets CSV](https://raw.githubusercontent.com/vincentarelbundock/Rdatasets/master/csv/datasets/AirPassengers.csv). The series is monthly international airline passenger totals, in thousands, from 1949 to 1960.
 
 ## Files
 
 - `app.py`: Streamlit user interface and charts
-- `forecasting.py`: windowing, scaling, training, evaluation, and recursive forecasts
+- `forecasting.py`: windowing, scaling, training, rolling-origin evaluation, and recursive forecasts
 - `datasets.py` and `data/airpassengers.csv`: example data
-- `tests/test_forecasting.py`: focused checks for data integrity and leakage-sensitive logic
+- `tests/`: focused checks for data integrity, leakage-sensitive logic, and app interaction
 
 Run tests with `python -m pytest -q` after installing dependencies and pytest.

@@ -11,7 +11,17 @@ import streamlit as st
 import torch
 
 from datasets import DATASET_NAMES, DemoSeries, load_dataset
-from forecasting import chronological_split, error_metrics, fit_model, fit_scaler
+from forecasting import (
+    BacktestSelection,
+    build_backtest,
+    chronological_split,
+    error_metrics,
+    fit_model,
+    fit_scaler,
+    recursive_forecast,
+    score_backtest,
+    select_backtest,
+)
 
 
 BLUE = "#2878B5"
@@ -19,6 +29,7 @@ TEAL = "#13A89E"
 PURPLE = "#7953B7"
 ORANGE = "#E58A35"
 GRAY = "#64748B"
+METHOD_COLORS = {"Last month": TEAL, "Seasonal naïve": ORANGE, "RNN": BLUE, "LSTM": PURPLE}
 
 
 def chart_style(fig: go.Figure, title: str, unit: str, height: int = 400) -> go.Figure:
@@ -82,17 +93,55 @@ def evaluation_chart(series: DemoSeries, split, results: dict, baseline: np.ndar
     return chart_style(fig, "Held-out test: rolling one-step predictions", series.unit)
 
 
-def forecast_chart(series: DemoSeries, horizon: int, results: dict, baseline: np.ndarray) -> go.Figure:
+def backtest_error_chart(scores: pd.DataFrame, metric: str, unit: str) -> go.Figure:
+    fig = go.Figure()
+    for method in scores["Method"].unique():
+        frame = scores.loc[scores["Method"] == method]
+        fig.add_trace(go.Scatter(
+            x=frame["Lead"], y=frame[metric], mode="lines+markers", name=method,
+            line=dict(color=METHOD_COLORS[method], width=2.5, dash="dot" if method == "Seasonal naïve" else "solid"),
+        ))
+    y_title = f"{metric} ({unit})" if metric in ("MAE", "RMSE") else f"{metric} (%)"
+    fig = chart_style(fig, f"Error by forecast lead time · {metric}", y_title)
+    fig.update_xaxes(title_text="Months ahead", dtick=1)
+    return fig
+
+
+def origin_chart(series: DemoSeries, selected: BacktestSelection, origin: int) -> go.Figure:
+    dates, values = series.values.index, series.values.to_numpy()
+    row = int(np.flatnonzero(selected.origins == origin)[0])
+    target_dates = dates[origin + 1:origin + 1 + selected.horizon]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates[max(0, origin - 23):origin + 1], y=values[max(0, origin - 23):origin + 1],
+        name="Known at origin", line=dict(color=GRAY, width=3),
+    ))
+    fig.add_trace(go.Scatter(
+        x=np.r_[dates[origin:origin + 1], target_dates],
+        y=np.r_[values[origin:origin + 1], selected.actual[row]],
+        name="Later actuals", line=dict(color="#1F2937", width=3),
+    ))
+    for method, matrix in selected.predictions.items():
+        fig.add_trace(go.Scatter(
+            x=np.r_[dates[origin:origin + 1], target_dates],
+            y=np.r_[values[origin:origin + 1], matrix[row]],
+            name=method,
+            line=dict(color=METHOD_COLORS[method], width=2.3, dash="dot" if method == "Seasonal naïve" else "solid"),
+        ))
+    fig.add_vline(x=dates[origin], line_color=PURPLE, line_dash="dash")
+    return chart_style(fig, f"What a planner could forecast in {dates[origin]:%b %Y}", series.unit)
+
+
+def forecast_chart(series: DemoSeries, horizon: int, paths: dict[str, np.ndarray]) -> go.Figure:
     dates, values = series.values.index, series.values.to_numpy()
     future_dates = pd.date_range(dates[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=dates[-36:], y=values[-36:], name="Observed", line=dict(color=GRAY, width=3)))
-    fig.add_trace(go.Scatter(x=future_dates, y=baseline, name="Seasonal naïve", line=dict(color=ORANGE, width=2, dash="dot")))
-    for kind, result in results.items():
-        color = BLUE if kind == "RNN" else PURPLE
+    for method, path in paths.items():
         fig.add_trace(go.Scatter(
-            x=np.r_[dates[-1:], future_dates], y=np.r_[values[-1:], result.future_predictions],
-            name=kind, line=dict(color=color, width=2.7),
+            x=np.r_[dates[-1:], future_dates], y=np.r_[values[-1:], path[:horizon]],
+            name=method,
+            line=dict(color=METHOD_COLORS[method], width=2.7, dash="dot" if method == "Seasonal naïve" else "solid"),
         ))
     fig.add_vline(x=future_dates[0], line_color=PURPLE, line_dash="dash")
     return chart_style(fig, "Future forecast: recursive multi-step predictions", series.unit)
@@ -159,7 +208,7 @@ def main() -> None:
         st.header("2 · Experiment")
         model_choice = st.selectbox("Network", ["Compare both", "RNN", "LSTM"])
         lookback = st.slider("Past months shown to model", 3, 36, 12, help="Number of past actuals in each input window.")
-        horizon = st.slider("Future months to forecast", 1, 24, 12)
+        horizon = st.slider("Forecast horizon (months)", 1, 24, 12, help="Changes the backtest and future chart without retraining the networks.")
         st.header("3 · Training")
         hidden_size = st.select_slider("Hidden units", options=[8, 16, 32, 64], value=32, help="Size of each recurrent hidden state. Larger models can capture more patterns but may overfit.")
         layers = st.select_slider("Recurrent layers", options=[1, 2, 3], value=1, help="Number of recurrent layers stacked on top of one another.")
@@ -188,7 +237,7 @@ def main() -> None:
         st.error("The lookback is too long for this dataset and training split.")
         st.stop()
 
-    signature = (dataset_name, model_choice, lookback, horizon, hidden_size, layers, epochs, learning_rate, batch_size, patience, device.type)
+    signature = (dataset_name, model_choice, lookback, hidden_size, layers, epochs, learning_rate, batch_size, patience, device.type)
     if train_clicked:
         torch.set_num_threads(min(4, os.cpu_count() or 1))
         scaler = fit_scaler(values[:split.train_end])
@@ -205,16 +254,34 @@ def main() -> None:
 
             results[kind] = fit_model(
                 kind, values, split, scaler, lookback, hidden_size, layers, epochs,
-                batch_size, learning_rate, patience, horizon, device, update,
+                batch_size, learning_rate, patience, device, update,
             )
+        status.caption("Computing rolling-origin forecasts on the test period…")
+        backtest = build_backtest(
+            values, split, {kind: result.model for kind, result in results.items()},
+            scaler, lookback, device, max_horizon=24,
+            callback=lambda completed, total: status.caption(
+                f"Computing rolling-origin forecasts · {completed}/{total} origins"
+            ) if completed == total or completed % 5 == 0 else None,
+        )
+        future_paths = {
+            "Last month": np.full(24, values[-1], dtype=np.float32),
+            "Seasonal naïve": _baseline_forecast(values, 24),
+        }
+        scaled = scaler.transform(values)
+        for kind, result in results.items():
+            future_paths[kind] = recursive_forecast(result.model, scaled, lookback, 24, scaler, device)
         progress.empty()
         status.empty()
-        st.session_state["experiment"] = {"signature": signature, "results": results}
+        st.session_state["experiment"] = {
+            "signature": signature, "results": results,
+            "backtest": backtest, "future_paths": future_paths,
+        }
 
     saved = st.session_state.get("experiment")
     current = saved is not None and saved["signature"] == signature
     if saved is not None and not current:
-        st.info("Settings changed. Select **Train and evaluate** to update the results below.")
+        st.info("Training settings changed. Select **Train and evaluate** to update the results.")
 
     explore_tab, score_tab, forecast_tab, learn_tab = st.tabs([
         "Explore the data", "Test the models", "Forecast ahead", "How it works",
@@ -245,46 +312,74 @@ def main() -> None:
             st.info("Choose your settings and select **Train and evaluate** to see the held-out comparison.")
         else:
             results = saved["results"]
-            baseline = values[split.val_end - 12:-12]
-            metrics = _metrics_frame(series, split, results)
-            st.subheader("Performance on unseen test months")
-            st.dataframe(metrics, width="stretch")
-            st.caption("MAE and RMSE are in the series unit; lower is better. WAPE is total absolute error divided by total actual demand. Compare validation and test MAE to spot changing conditions.")
-            st.plotly_chart(evaluation_chart(series, split, results, baseline), width="stretch")
+            selected = select_backtest(saved["backtest"], horizon)
+            scores = pd.DataFrame(score_backtest(selected))
+            st.subheader("Rolling-origin backtest")
             st.info(
-                "These are rolling **one-step** predictions. At each test month, the input window may include "
-                "actuals from earlier test months. Model weights never update on validation or test data."
+                "At each origin, every method forecasts the next months recursively using only information "
+                "available then. The networks reuse the weights selected on validation data; they are not retrained "
+                "during the test period. All methods and lead times below use the same complete forecast origins."
             )
-            st.plotly_chart(loss_chart(results), width="stretch")
-            cols = st.columns(len(results))
-            for col, (kind, result) in zip(cols, results.items()):
-                with col:
-                    st.metric(f"{kind} best epoch", result.best_epoch)
-                    st.caption(f"{result.parameter_count:,} trainable parameters; stopped after {len(result.history)} epochs.")
+            st.metric("Complete forecast origins", len(selected.origins))
+            if len(selected.origins) < 10:
+                st.warning("Fewer than 10 complete origins fit this horizon. Treat comparisons as illustrative; shorter horizons have more test cases.")
+            st.caption(
+                f"The selected {horizon}-month horizon determines which test origins qualify. "
+                "Changing it may change the cohort even at lead 1."
+            )
+            metric_choice = st.selectbox(
+                "Chart metric", ["WAPE", "MAE", "RMSE", "Bias"],
+                format_func=lambda metric: f"{metric} %" if metric in ("WAPE", "Bias") else metric,
+            )
+            st.plotly_chart(backtest_error_chart(scores, metric_choice, series.unit), width="stretch")
+            st.caption("Lower MAE, RMSE, and WAPE are better. Bias is signed: positive means overforecasting; zero is ideal.")
+            lead = st.slider("Compare this lead time (months ahead)", 1, horizon, horizon)
+            lead_scores = scores.loc[scores["Lead"] == lead, ["Method", "MAE", "RMSE", "WAPE", "Bias", "Origins"]].copy()
+            lead_scores = lead_scores.rename(columns={"WAPE": "WAPE %", "Bias": "Bias %"}).set_index("Method")
+            st.dataframe(lead_scores.style.format({
+                "MAE": "{:.2f}", "RMSE": "{:.2f}", "WAPE %": "{:.2f}", "Bias %": "{:+.2f}",
+            }), width="stretch")
+            st.subheader("Inspect one forecast origin")
+            origin = st.select_slider(
+                "Last known month", options=selected.origins.tolist(),
+                value=int(selected.origins[-1]),
+                format_func=lambda index: f"{series.values.index[index]:%b %Y}",
+            )
+            st.plotly_chart(origin_chart(series, selected, origin), width="stretch")
+            with st.expander("One-step and training diagnostics"):
+                baseline = values[split.val_end - 12:-12]
+                st.dataframe(_metrics_frame(series, split, results), width="stretch")
+                st.caption("One-step predictions may use earlier test actuals as inputs. They are easier than a recursive multi-month forecast. Validation MAE helps reveal changing conditions.")
+                st.plotly_chart(evaluation_chart(series, split, results, baseline), width="stretch")
+                st.plotly_chart(loss_chart(results), width="stretch")
+                cols = st.columns(len(results))
+                for col, (kind, result) in zip(cols, results.items()):
+                    with col:
+                        st.metric(f"{kind} best epoch", result.best_epoch)
+                        st.caption(f"{result.parameter_count:,} trainable parameters; stopped after {len(result.history)} epochs.")
 
     with forecast_tab:
         if not current:
             st.info("Train a model to produce a future forecast.")
         else:
-            results = saved["results"]
-            baseline_future = _baseline_forecast(values, horizon)
-            st.plotly_chart(forecast_chart(series, horizon, results, baseline_future), width="stretch")
+            paths = saved["future_paths"]
+            st.plotly_chart(forecast_chart(series, horizon, paths), width="stretch")
             st.warning(
-                "Future months use each prior prediction as input. Errors can compound, so this curve is a "
-                "harder task than the rolling one-step test. No future promotions, prices, holidays, or "
+                "Future months use each prior prediction as input, matching the rolling-origin backtest. "
+                "No future promotions, prices, holidays, or "
                 "business decisions are supplied to the model. These are point forecasts, not uncertainty ranges."
             )
             st.caption("For this learning experiment, network weights were fit only on the first 60% of history. The latest actuals are used as forecast inputs. A production model would normally be refit on all available history after evaluation.")
             future_dates = pd.date_range(series.values.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-            forecast_frame = pd.DataFrame({"date": future_dates, "seasonal_naive": baseline_future})
-            for kind, result in results.items():
-                forecast_frame[kind.lower()] = result.future_predictions
+            forecast_frame = pd.DataFrame({"date": future_dates})
+            for method, path in paths.items():
+                forecast_frame[method.lower().replace(" ", "_").replace("ï", "i")] = path[:horizon]
             st.dataframe(forecast_frame.style.format(precision=1), width="stretch", hide_index=True)
             st.download_button(
                 "Download forecast CSV", forecast_frame.to_csv(index=False).encode("utf-8"),
                 file_name="demand_forecast_demo.csv", mime="text/csv",
             )
-            if any(np.any(result.future_predictions < 0) for result in results.values()):
+            if any(np.any(paths[kind][:horizon] < 0) for kind in saved["results"]):
                 st.caption("A network produced a negative forecast. Raw outputs are shown so you can see that behavior.")
 
     with learn_tab:
@@ -314,8 +409,8 @@ def main() -> None:
         3. **Build windows:** each input contains the chosen number of past actuals; the target is the next month.
         4. **Train:** Adam minimizes mean squared error. Gradient clipping helps stabilize updates.
         5. **Stop early:** the best validation epoch is restored. The test period never selects weights or stopping time.
-        6. **Evaluate fairly:** compare the networks with last-month and seasonal naïve forecasts on the same test months.
-        7. **Forecast ahead:** roll predictions forward one month at a time from the end of observed history.
+        6. **Backtest:** at each test origin, roll predictions forward for the selected horizon. Compare networks and naïve methods on the same complete origins.
+        7. **Forecast ahead:** use the same recursive approach from the end of observed history.
         """)
         st.subheader("Suggested experiments")
         st.markdown("""
@@ -326,8 +421,8 @@ def main() -> None:
         - Try a larger hidden state. Watch whether validation loss improves even when training loss keeps falling.
         """)
         st.caption(
-            "This is a one-series, univariate learning demo. For production planning, also test multiple forecast origins, "
-            "business drivers, intermittent demand handling, forecast bias, uncertainty, and the hierarchy of SKUs and locations."
+            "This is a one-series, univariate learning demo. For production planning, also consider "
+            "business drivers, intermittent demand, uncertainty, model refresh, and the hierarchy of SKUs and locations."
         )
 
 

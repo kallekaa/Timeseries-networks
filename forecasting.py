@@ -1,4 +1,4 @@
-"""Leakage-aware one-step evaluation and recursive monthly forecasts with PyTorch."""
+"""Leakage-aware training, rolling-origin evaluation, and monthly forecasts."""
 
 from copy import deepcopy
 from dataclasses import dataclass
@@ -89,8 +89,27 @@ class ModelResult:
     best_epoch: int
     val_predictions: np.ndarray
     test_predictions: np.ndarray
-    future_predictions: np.ndarray
     parameter_count: int
+
+
+@dataclass
+class BacktestResult:
+    """One row per forecast origin; unavailable future months are NaN."""
+
+    origins: np.ndarray
+    actual: np.ndarray
+    predictions: dict[str, np.ndarray]
+    max_horizon: int
+
+
+@dataclass
+class BacktestSelection:
+    """A common cohort of origins with all selected lead times observed."""
+
+    origins: np.ndarray
+    actual: np.ndarray
+    predictions: dict[str, np.ndarray]
+    horizon: int
 
 
 def _predict(model: RecurrentForecaster, x: np.ndarray, device: torch.device) -> np.ndarray:
@@ -120,17 +139,77 @@ def recursive_forecast(
     return scaler.inverse(np.asarray(forecasts))
 
 
+def build_backtest(
+    values: np.ndarray,
+    split: Split,
+    models: dict[str, RecurrentForecaster],
+    scaler: Scaler,
+    lookback: int,
+    device: torch.device,
+    max_horizon: int = 24,
+    callback: Callable[[int, int], None] | None = None,
+) -> BacktestResult:
+    """Forecast from each test origin with weights fixed and history cut at that origin."""
+    values = np.asarray(values, dtype=np.float32)
+    if split.n != len(values) or max_horizon < 1 or split.val_end < max(lookback, 12):
+        raise ValueError("Invalid split, lookback, or maximum horizon for backtesting.")
+    origins = np.arange(split.val_end - 1, split.n - 1, dtype=int)
+    actual = np.full((len(origins), max_horizon), np.nan, dtype=np.float32)
+    predictions = {
+        name: np.full_like(actual, np.nan)
+        for name in ["Last month", "Seasonal naïve", *models]
+    }
+    scaled = scaler.transform(values)
+    for row, origin in enumerate(origins):
+        steps = min(max_horizon, split.n - origin - 1)
+        actual[row, :steps] = values[origin + 1:origin + 1 + steps]
+        predictions["Last month"][row, :steps] = values[origin]
+        predictions["Seasonal naïve"][row, :steps] = np.resize(values[origin - 11:origin + 1], steps)
+        for name, model in models.items():
+            predictions[name][row, :steps] = recursive_forecast(
+                model, scaled[:origin + 1], lookback, steps, scaler, device,
+            )
+        if callback is not None:
+            callback(row + 1, len(origins))
+    return BacktestResult(origins, actual, predictions, max_horizon)
+
+
+def select_backtest(backtest: BacktestResult, horizon: int) -> BacktestSelection:
+    """Require a complete selected horizon for every scored origin and method."""
+    if not 1 <= horizon <= backtest.max_horizon:
+        raise ValueError("Horizon is outside the computed backtest range.")
+    complete = np.isfinite(backtest.actual[:, horizon - 1])
+    if not complete.any():
+        raise ValueError("No forecast origins have the full selected horizon.")
+    actual = backtest.actual[complete, :horizon]
+    predictions = {name: matrix[complete, :horizon] for name, matrix in backtest.predictions.items()}
+    if not np.isfinite(actual).all() or any(not np.isfinite(matrix).all() for matrix in predictions.values()):
+        raise ValueError("A complete backtest path contains a non-finite value.")
+    return BacktestSelection(backtest.origins[complete], actual, predictions, horizon)
+
+
+def score_backtest(selected: BacktestSelection) -> list[dict[str, float | int | str]]:
+    """Scores at each lead time, always over the same selected origins."""
+    rows = []
+    for name, matrix in selected.predictions.items():
+        for lead in range(selected.horizon):
+            scores = error_metrics(selected.actual[:, lead], matrix[:, lead])
+            rows.append({"Method": name, "Lead": lead + 1, "Origins": len(selected.origins), **scores})
+    return rows
+
+
 def error_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
     actual = np.asarray(actual, dtype=float)
     predicted = np.asarray(predicted, dtype=float)
     if actual.shape != predicted.shape or actual.size == 0:
         raise ValueError("Actual and predicted arrays must have the same nonzero shape.")
-    error = actual - predicted
+    error = predicted - actual
     denominator = np.abs(actual).sum()
     return {
         "MAE": float(np.abs(error).mean()),
         "RMSE": float(np.sqrt(np.square(error).mean())),
         "WAPE": float(np.abs(error).sum() / denominator * 100) if denominator > 0 else float("nan"),
+        "Bias": float(error.sum() / denominator * 100) if denominator > 0 else float("nan"),
     }
 
 
@@ -146,7 +225,6 @@ def fit_model(
     batch_size: int,
     learning_rate: float,
     patience: int,
-    horizon: int,
     device: torch.device,
     callback: Callable[[str, int, int, float, float], None] | None = None,
 ) -> ModelResult:
@@ -211,7 +289,6 @@ def fit_model(
     model.load_state_dict(best_state)
     val_predictions = scaler.inverse(_predict(model, val_x, device))
     test_predictions = scaler.inverse(_predict(model, test_x, device))
-    future_predictions = recursive_forecast(model, scaled, lookback, horizon, scaler, device)
     return ModelResult(
         kind=kind,
         model=model,
@@ -219,6 +296,5 @@ def fit_model(
         best_epoch=best_epoch,
         val_predictions=val_predictions,
         test_predictions=test_predictions,
-        future_predictions=future_predictions,
         parameter_count=sum(p.numel() for p in model.parameters()),
     )
